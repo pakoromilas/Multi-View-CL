@@ -9,6 +9,7 @@ import torchvision.transforms as transforms
 from utils import datautils
 import models
 from utils import utils
+from utils import dataloaders
 import numpy as np
 import PIL
 from tqdm import tqdm
@@ -17,22 +18,31 @@ from utils.lars_optimizer import LARS
 import scipy
 from torch.nn.parallel import DistributedDataParallel as DDP
 import torch.distributed as dist
+import torchvision
+from packaging import version
 
 import copy
+
+import warnings
+warnings.simplefilter("ignore", UserWarning)
+
 
 class BaseSSL(nn.Module):
     """
     Inspired by the PYTORCH LIGHTNING https://pytorch-lightning.readthedocs.io/en/latest/
     Similar but lighter and customized version.
     """
-    DATA_ROOT = os.environ.get('DATA_ROOT', os.path.dirname(os.path.abspath(__file__)) + '/data')
-    IMAGENET_PATH = os.environ.get('IMAGENET_PATH', '/home/aashukha/imagenet/raw-data/')
+    IMAGENET_PATH = os.environ.get('IMAGENET_PATH', '/nvme/h/gr23pk1/data_aiml/koromilas/data/imagenet-100/')
+    IMAGENET1K_PATH = os.environ.get('IMAGENET_PATH', '/home/ubuntu/ILSVRC/Data/CLS-LOC/')
+    AwA2_PATH = os.environ.get('AwA2_PATH', '/nvme/h/gr23pk1/data_p102/koromilas/Data/Animals_with_Attributes2/')
 
     def __init__(self, hparams):
         super().__init__()
         self.hparams = hparams
         if hparams.data == 'imagenet':
             print(f"IMAGENET_PATH = {self.IMAGENET_PATH}")
+        elif hparams.data == 'imagenet1k':
+            print(f"IMAGENET1K_PATH = {self.IMAGENET1K_PATH}")
 
     def get_ckpt(self):
         return {
@@ -45,7 +55,6 @@ class BaseSSL(nn.Module):
         parser = ArgumentParser()
         cls.add_model_hparams(parser)
         hparams = parser.parse_args([], namespace=ckpt['hparams'])
-
         res = cls(hparams, device=device)
         res.load_state_dict(ckpt['state_dict'])
         return res
@@ -68,17 +77,41 @@ class BaseSSL(nn.Module):
         return None, None
 
     def prepare_data(self):
+        
+        if not self.hparams.data_root:
+            self.DATA_ROOT = os.environ.get('DATA_ROOT', os.path.dirname(os.path.abspath(__file__)) + '/data')
+        else:
+            self.DATA_ROOT = self.hparams.data_root
+            
         train_transform, test_transform = self.transforms()
         # print('The following train transform is used:\n', train_transform)
         # print('The following test transform is used:\n', test_transform)
         if self.hparams.data == 'cifar':
             self.trainset = datasets.CIFAR10(root=self.DATA_ROOT, train=True, download=True, transform=train_transform)
             self.testset = datasets.CIFAR10(root=self.DATA_ROOT, train=False, download=True, transform=test_transform)
+        elif self.hparams.data == 'cifar100':
+            self.trainset = datasets.CIFAR100(root=self.DATA_ROOT, train=True, download=True, transform=train_transform)
+            self.testset = datasets.CIFAR100(root=self.DATA_ROOT, train=False, download=True, transform=test_transform)
+        elif self.hparams.data == 'stl10':
+            if self.hparams.problem == 'eval':
+                self.trainset = datasets.STL10(root=self.DATA_ROOT, split='train', download=True, transform=train_transform)
+            else:
+                self.trainset = datasets.STL10(root=self.DATA_ROOT, split='train+unlabeled', download=True, transform=train_transform)
+            self.testset = datasets.STL10(root=self.DATA_ROOT, split='test', download=True, transform=test_transform)           
         elif self.hparams.data == 'imagenet':
             traindir = os.path.join(self.IMAGENET_PATH, 'train')
-            valdir = os.path.join(self.IMAGENET_PATH, 'val')
+            valdir = os.path.join(self.IMAGENET_PATH, 'val.X')
             self.trainset = datasets.ImageFolder(traindir, transform=train_transform)
             self.testset = datasets.ImageFolder(valdir, transform=test_transform)
+        elif self.hparams.data == 'imagenet1k':
+            traindir = os.path.join(self.IMAGENET1K_PATH, 'train')
+            valdir = os.path.join(self.IMAGENET1K_PATH, 'val')
+            self.trainset = datasets.ImageFolder(traindir, transform=train_transform)
+            self.testset = datasets.ImageFolder(valdir, transform=test_transform)
+        elif self.hparams.data == 'awa2':
+            self.trainset = dataloaders.AnimalDataset(self.AwA2_PATH, 'allclasses.txt', True, True)
+            self.testset = dataloaders.AnimalDataset(self.AwA2_PATH, 'allclasses.txt', True, False)
+        
         else:
             raise NotImplementedError
 
@@ -115,6 +148,7 @@ class BaseSSL(nn.Module):
 
     @classmethod
     def add_model_hparams(cls, parser):
+        parser.add_argument('--data_root', help='Dataset to use', default=None)
         parser.add_argument('--data', help='Dataset to use', default='cifar')
         parser.add_argument('--arch', default='ResNet50', help='Encoder architecture')
         parser.add_argument('--batch_size', default=256, type=int, help='The number of unique images in the batch')
@@ -126,7 +160,23 @@ class SimCLR(BaseSSL):
     @BaseSSL.add_parent_hparams
     def add_model_hparams(cls, parser):
         # loss params
-        parser.add_argument('--temperature', default=0.1, type=float, help='Temperature in the NTXent loss')
+        parser.add_argument('--loss', default="NTXent", type=str, help='Type of contrastive loss')
+        parser.add_argument('--loss_pwe', default=False, type=bool, help='Compute pairwise losses in case of many views')
+        parser.add_argument('--loss_avg', default=False, type=bool, help='Compute average embedding in case of many views')
+        
+        parser.add_argument('--kernel', default=None, type=str,
+            help='Kernel for kernelized loss',
+            choices=['linear', 'log', 'riesz', 'gaussian', 'gaussian_tau', 'gaussian_riesz', 'imq', 'riesz_smooth'],
+        )
+        parser.add_argument('--kernel_p', default=2.0, type=float, help='p for kernel')
+        
+        parser.add_argument('--temperature', default=0.1, type=float, help='Temperature in the loss')
+        parser.add_argument('--contrast_mode', default='all', type=str,
+            help='')
+        parser.add_argument('--pretrain_pwe', default=False, type=bool)
+        parser.add_argument('--pretrain_avg', default=False, type=bool)
+        
+
         # data params
         parser.add_argument('--multiplier', default=2, type=int)
         parser.add_argument('--color_dist_s', default=1., type=float, help='Color distortion strength')
@@ -156,13 +206,55 @@ class SimCLR(BaseSSL):
             self.model = nn.DataParallel(model)
         else:
             raise NotImplementedError
-
-        self.criterion = models.losses.NTXent(
-            tau=hparams.temperature,
-            multiplier=hparams.multiplier,
-            distributed=(hparams.dist == 'ddp'),
-        )
-
+        
+        if hparams.loss == "NTXent":
+            self.criterion = models.losses.NTXent(
+                tau=hparams.temperature,
+                multiplier=hparams.multiplier,
+                pwe=hparams.loss_pwe,
+                average=hparams.loss_avg,
+                mv=False,
+                distributed=(hparams.dist == 'ddp'),
+            )
+        elif hparams.loss == "MVINFONCE":
+            self.criterion = models.losses.MVINFONCE(
+                tau=hparams.temperature,
+                multiplier=hparams.multiplier,
+                distributed=(hparams.dist == 'ddp'),
+            )
+        elif hparams.loss == "MVDHEL":
+            self.criterion = models.losses.MVDHEL(
+                tau=hparams.temperature,
+                multiplier=hparams.multiplier,
+                pwe=hparams.loss_pwe,
+                average=hparams.loss_avg,
+                distributed=(hparams.dist == 'ddp'),
+            )
+        elif hparams.loss == "PVCLoss":
+            self.criterion = models.losses.PVCLoss(
+                tau=hparams.temperature,
+                multiplier=hparams.multiplier,
+                distributed=(hparams.dist == 'ddp'),
+            )
+        elif hparams.loss == "CL_1":
+            self.criterion = models.losses.CL_1(
+                tau=hparams.temperature,
+                multiplier=hparams.multiplier,
+                distributed=(hparams.dist == 'ddp'),
+            )
+        
+        elif hparams.loss == "CL_2":
+            self.criterion = models.losses.CL_2(
+                tau=hparams.temperature,
+                multiplier=hparams.multiplier,
+                pwe=hparams.loss_pwe,
+                average=hparams.loss_avg,
+                distributed=(hparams.dist == 'ddp'),
+            )
+        else:
+            raise NotImplementedError
+        print("====> Using {} loss".format(hparams.loss))
+                
     def reset_parameters(self):
         def conv2d_weight_truncated_normal_init(p):
             fan_in = p.shape[1]
@@ -235,7 +327,7 @@ class SimCLR(BaseSSL):
         )
 
     def transforms(self):
-        if self.hparams.data == 'cifar':
+        if 'cifar' in self.hparams.data:
             train_transform = transforms.Compose([
                 transforms.RandomResizedCrop(
                     32,
@@ -248,8 +340,21 @@ class SimCLR(BaseSSL):
                 datautils.Clip(),
             ])
             test_transform = train_transform
-
-        elif self.hparams.data == 'imagenet':
+        elif self.hparams.data == "stl10":
+            
+            train_transform = transforms.Compose([
+                transforms.RandomResizedCrop(
+                    96,
+                    scale=(self.hparams.scale_lower, 1.0),
+                    interpolation=PIL.Image.BICUBIC,
+                ),
+                transforms.RandomHorizontalFlip(),
+                datautils.get_color_distortion(s=self.hparams.color_dist_s),
+                transforms.ToTensor(),
+                datautils.Clip(),
+            ])
+            test_transform = train_transform
+        elif self.hparams.data == 'imagenet' or self.hparams.data == 'imagenet1k' or self.hparams.data == 'awa2':
             from utils.datautils import GaussianBlur
 
             im_size = 224
@@ -266,6 +371,8 @@ class SimCLR(BaseSSL):
                 datautils.Clip(),
             ])
             test_transform = train_transform
+        else:
+            raise NotImplementedError
         return train_transform, test_transform
 
     def get_ckpt(self):
