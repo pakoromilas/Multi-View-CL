@@ -32,10 +32,9 @@ class BaseSSL(nn.Module):
     Inspired by the PYTORCH LIGHTNING https://pytorch-lightning.readthedocs.io/en/latest/
     Similar but lighter and customized version.
     """
-    IMAGENET_PATH = os.environ.get('IMAGENET_PATH', '/nvme/h/gr23pk1/data_aiml/koromilas/data/imagenet-100/')
-    IMAGENET1K_PATH = os.environ.get('IMAGENET_PATH', '/home/ubuntu/ILSVRC/Data/CLS-LOC/')
-    AwA2_PATH = os.environ.get('AwA2_PATH', '/nvme/h/gr23pk1/data_p102/koromilas/Data/Animals_with_Attributes2/')
-
+    IMAGENET_PATH = os.environ.get('IMAGENET_PATH', 'your imagenet-100 path')
+    IMAGENET1K_PATH = os.environ.get('IMAGENET_PATH', 'your imagenet1K path')
+    
     def __init__(self, hparams):
         super().__init__()
         self.hparams = hparams

@@ -12,6 +12,9 @@ import sys
 import torch.multiprocessing as mp
 import torch.distributed as dist
 import socket
+import tempfile
+from packaging import version
+
 
 
 def add_learner_params(parser):
@@ -26,6 +29,7 @@ def add_learner_params(parser):
         help='Optional checkpoint to init the model.'
     )
     parser.add_argument('--verbose', default=False, type=bool)
+
     # optimizer params
     parser.add_argument('--lr_schedule', default='warmup-anneal')
     parser.add_argument('--opt', default='lars', help='Optimizer to use', choices=['sgd', 'adam', 'lars'])
@@ -58,8 +62,10 @@ def add_learner_params(parser):
 
 def main():
     parser = myexman.ExParser(file=os.path.basename(__file__))
+    # parse train params
+    #parser = argparse.ArgumentParser()
     add_learner_params(parser)
-
+    #args = parser.parse_args()
     is_help = False
     if '--help' in sys.argv or '-h' in sys.argv:
         sys.argv.pop(sys.argv.index('--help' if '--help' in sys.argv else '-h'))
@@ -72,9 +78,10 @@ def main():
     if is_help:
         sys.argv.append('--help')
 
+    # parse method params
     args = parser.parse_args(namespace=args)
-
-    if args.data == 'imagenet' and args.aug == False:
+    
+    if 'imagenet' in args.data and args.aug == False:
         raise Exception('ImageNet models should be eval with aug=True!')
 
     if args.seed != -1:
@@ -91,18 +98,33 @@ def main():
         args.number_of_processes = args.world_size * ngpus
         parser.update_params_file(args)
 
-        args.world_size *= ngpus
+        args.world_size *= ngpus    
         mp.spawn(
             main_worker,
             nprocs=ngpus,
             args=(ngpus, args),
         )
     else:
-        parser.update_params_file(args)
         main_worker(args.gpu, -1, args)
-
+        
+    return args.root, args
 
 def main_worker(gpu, ngpus, args):
+    if args.arch == "linear":
+        job_type = "linear"
+        group = args.encoder_ckpt
+        tags = ["loss/{}".format(args.pretrain_loss), "multiplier/{}".format(args.pretrain_multiplier),
+                "temperature/{}".format(args.pretrain_temperature), "batch_size/{}".format(args.pretrain_batch_size),
+                "pretrain_pwe/{}".format(args.pretrain_pwe), "pretrain_avg/{}".format(args.pretrain_avg),
+                "sum"]
+    else:
+        job_type = "pretrain"
+        group=os.path.join(args.root, 'checkpoint.pth.tar')
+        tags = ["loss/{}".format(args.loss), "multiplier/{}".format(args.multiplier),
+                "temperature/{}".format(args.temperature), "batch_size/{}".format(args.batch_size),
+                "pretrain_pwe/{}".format(args.pretrain_pwe), "pretrain_avg/{}".format(args.pretrain_avg),
+                "sum", "new"]
+    
     fmt = {
         'train_time': '.3f',
         'val_time': '.3f',
@@ -136,13 +158,16 @@ def main_worker(gpu, ngpus, args):
     model = models.REGISTERED_MODELS[args.problem](args, device=device)
 
     if args.ckpt != '':
-        ckpt = torch.load(args.ckpt, map_location=device)
+        if version.parse(torch.__version__) >= version.parse("2.6"):
+            ckpt = torch.load(args.ckpt, map_location=device, weights_only=False)
+        else:
+            ckpt = torch.load(args.ckpt, map_location=device)
         model.load_state_dict(ckpt['state_dict'])
 
     # Data loading code
     model.prepare_data()
     train_loader, val_loader = model.dataloaders(iters=args.iters)
-
+    
     # define optimizer
     cur_iter = 0
     optimizer, scheduler = models.ssl.configure_optimizers(args, model, cur_iter - 1)
@@ -150,6 +175,8 @@ def main_worker(gpu, ngpus, args):
     # optionally resume from a checkpoint
     if args.ckpt and not args.eval_only:
         optimizer.load_state_dict(ckpt['opt_state_dict'])
+        scheduler.load_state_dict(ckpt['scheduler'])
+        cur_iter = ckpt['iter']
 
     cudnn.benchmark = True
 
@@ -170,6 +197,10 @@ def main_worker(gpu, ngpus, args):
             logs = {}
             if not args.eval_only:
                 # forward pass and compute loss
+                x, _ = batch
+                if torch.isnan(x).any():
+                    continue
+                
                 logs = model.train_step(batch, cur_iter)
                 loss = logs['loss']
 
@@ -182,7 +213,7 @@ def main_worker(gpu, ngpus, args):
             train_logs.append({k: utils.tonp(v) for k, v in logs.items()})
 
             if cur_iter % args.save_freq == 0 and args.rank == 0:
-                save_checkpoint(args.root, model, optimizer, cur_iter)
+                save_checkpoint(args.root, model, optimizer, scheduler, cur_iter)
 
             if cur_iter % args.eval_freq == 0 or cur_iter >= args.iters:
                 # TODO: aggregate metrics over all processes
@@ -192,7 +223,7 @@ def main_worker(gpu, ngpus, args):
                     for batch in val_loader:
                         batch = [x.to(device) for x in batch]
                         # forward pass
-                        logs = model.test_step(batch)
+                        logs = model.test_step(batch) #TODO: add uniformity, alignment, tolerance
                         # save logs for the batch
                         test_logs.append(logs)
                 model.train()
@@ -203,7 +234,8 @@ def main_worker(gpu, ngpus, args):
             it_time += time.time() - start_time
 
             if (cur_iter % args.log_freq == 0 or cur_iter >= args.iters) and args.rank == 0:
-                save_checkpoint(args.root, model, optimizer)
+                save_checkpoint(args.root, model, optimizer, scheduler, cur_iter,  save_iter=False)
+
                 train_logs = utils.agg_all_metrics(train_logs)
 
                 logger.add_logs(cur_iter, train_logs, pref='train_')
@@ -211,6 +243,7 @@ def main_worker(gpu, ngpus, args):
                 logger.add_scalar(cur_iter, 'data_time', data_time)
                 logger.add_scalar(cur_iter, 'it_time', it_time)
                 logger.iter_info()
+                metrics = logger.get_last_scalars()
                 logger.save()
 
                 data_time, it_time = 0, 0
@@ -225,14 +258,15 @@ def main_worker(gpu, ngpus, args):
 
             start_time = time.time()
 
-    save_checkpoint(args.root, model, optimizer)
-
+    save_checkpoint(args.root, model, optimizer, scheduler)
+    
     if args.dist == 'ddp':
         dist.destroy_process_group()
+    
 
 
-def save_checkpoint(path, model, optimizer, cur_iter=None):
-    if cur_iter is None:
+def save_checkpoint(path, model, optimizer, scheduler, cur_iter=None, save_iter=True):
+    if (cur_iter is None) or not save_iter:
         fname = os.path.join(path, 'checkpoint.pth.tar')
     else:
         fname = os.path.join(path, 'checkpoint-%d.pth.tar' % cur_iter)
@@ -241,6 +275,7 @@ def save_checkpoint(path, model, optimizer, cur_iter=None):
     ckpt.update(
         {
             'opt_state_dict': optimizer.state_dict(),
+            'scheduler': scheduler.state_dict(),
             'iter': cur_iter,
         }
     )
