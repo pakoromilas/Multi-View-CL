@@ -36,7 +36,7 @@ Our methods consistently outperform existing approaches across all benchmarks:
 
 | Dataset | Method | 2 Views | 4 Views |
 |---------|--------|---------|---------|
-| ImageNet-100 | Baseline Best | 72.2% | 75.0% |
+| ImageNet-100 | Baseline Best | 72.2% | 74.4% |
 | | **MV-DHEL** | **73.3%** | **77.2%** |
 | ImageNet-1K | Baseline Best | 60.0% | 62.4% |
 | | **MV-DHEL** | **61.2%** | **62.6%** |
