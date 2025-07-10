@@ -1,6 +1,6 @@
 # A Principled Framework for Multi-View Contrastive Learning
 
-[![Paper](https://img.shields.io/badge/arXiv-Coming_Soon-b31b1b.svg)](https://github.com/pakoromilas/Multi-View-CL)
+[![Paper](https://img.shields.io/badge/arXiv-2507.06979-b31b1b.svg)](https://arxiv.org/abs/2507.06979)
 [![PyTorch](https://img.shields.io/badge/pytorch-1.10+-red.svg)](https://pytorch.org/)
 
 **[Panagiotis Koromilas](https://scholar.google.com/citations?user=DMI5W9wAAAAJ&hl=el), Efthymios Georgiou, Giorgos Bouritsas, Theodoros Giannakopoulos, Mihalis A. Nicolaou, Yannis Panagakis**
@@ -147,7 +147,7 @@ If you find our work useful, please cite:
   title={A Principled Framework for Multi-View Contrastive Learning},
   author={Koromilas, Panagiotis and Georgiou, Efthymios and Bouritsas, Giorgos and 
           Giannakopoulos, Theodoros and Nicolaou, Mihalis A. and Panagakis, Yannis},
-  journal={arXiv preprint arXiv:xxxx.xxxxx},
+  journal={arXiv preprint arXiv:2507.06979},
   year={2025}
 }
 ```
